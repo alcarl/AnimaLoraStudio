@@ -86,14 +86,19 @@ class Krea2Int8Family(Krea2Family):
                  attention_backend: str = "flash_attn", repo_root=None,
                  purpose: str = "train", blocks_to_swap: int = 0):
         from training.families.krea2_int8.loader import load_krea2_int8_model
+        from training.families.krea2_int8.vendor.convrot_int8_kernels import HAS_TRITON
 
         if attention_backend != "none":
             logger.info(
                 "Krea2 int8 当前固定使用 PyTorch SDPA；忽略 attention_backend=%s",
                 attention_backend,
             )
+        # backward 反向：triton 可用时走 "int8" 融合 GEMM（更快且省显存——不物化 bf16
+        # 反量化权重拷贝），否则回退 "bf16" 瞬时反量化。
+        bwd_mode = "int8" if HAS_TRITON else "bf16"
         return load_krea2_int8_model(
             path, device, dtype, purpose=purpose, blocks_to_swap=blocks_to_swap,
+            bwd_mode=bwd_mode,
         )
 
 
