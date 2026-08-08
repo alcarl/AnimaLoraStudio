@@ -474,28 +474,24 @@ if HAS_TRITON:
         if convrot:
             h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
             
-            # --- AMD 专属优化 1: 原地 Hadamard 旋转，避免产生 x_rotated ---
+            # 为了配合 Gradient Checkpointing，这里使用非原地操作
             n_groups = k // convrot_groupsize
             x_grouped = x_2d.reshape(-1, n_groups, convrot_groupsize)
             h = h.to(dtype=x_2d.dtype, device=x_2d.device)
-            # 通过 out= 直接覆盖原显存空间
-            torch.matmul(x_grouped, h, out=x_grouped)
             
-            # 释放 Hadamard 矩阵并断开引用
-            del h
+            # 分配临时旋转张量，不破坏原始的 x_2d
+            x_rotated_3d = torch.matmul(x_grouped, h)
+            x_rotated = x_rotated_3d.reshape(m, k)
             
-            # 此时 x_2d 内部数据已经变成了旋转后的结果
-            x_int8, x_scale = triton_quantize_rowwise(x_2d)
-
+            # 执行量化
+            x_int8, x_scale = triton_quantize_rowwise(x_rotated)
+            
+            # --- AMD 专属优化：量化完成后立即释放临时张量，腾出连续显存空间 ---
+            del x_rotated_3d, x_rotated, h
         else:
             x_int8, x_scale = triton_quantize_rowwise(x_2d)
-            
-        # --- AMD 专属优化 2: 提前解除对老高精度激活值的引用 ---
-        # 量化已经完成，x_2d 及其引用的底层显存如果后续不需要，应在此处解除引用
-        # 这一步能让 ROCm 的显存分配器在 output 申请空间前，有更大的连续空闲块
-        del x_2d
-        
-        # 此时申请巨型输出矩阵，显存已经降到最低安全水位
+
+        # 此时申请巨型输出矩阵，显存已经被手动清理过，处于当前步骤的安全低谷
         output = torch.empty((m, n), device=x.device, dtype=out_dtype)
 
         is_per_channel = False
