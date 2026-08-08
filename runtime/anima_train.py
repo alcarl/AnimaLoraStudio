@@ -117,11 +117,14 @@ from training.loss_weighting import compute_loss_weight  # noqa: E402
 
 
 def _log_allocator_state() -> None:
-    """打印实际生效的 CUDA 分配器配置，用于定位「显存充足却分不到小块」的 OOM。
+    """把 CUDA 进程显存上限提到 95% 并打印实际 allocator 配置。
 
-    关键：expandable_segments 只在 ``PYTORCH_CUDA_ALLOC_CONF`` 在 torch import 前被读到
-    才生效；若环境变量被残留值覆盖或平台不支持（TORCH_WARN_ONCE 后强制关闭），
-    这里会与预期不符。同时打印 memory fraction，排除外部库把进程显存限死。
+    定位「显存充足却分不到小块」的 OOM 时发现：torch 2.11 的 ``cudaMallocAsync``
+    backend 默认把进程 pool 锁在 ~16GB（24GB 卡的 2/3，实测 ``PyTorch limit:
+    17179869184``），即使物理显存还有 8GB+。用 ``set_per_process_memory_fraction``
+    显式提到 0.95 反制（对两种 backend 都生效：cudaMallocAsync 通过 pool 大小、
+    expandable_segments 通过上限）。必须在 CUDA 初始化后、任何大分配前调用。
+    打印设置后的 fraction 与 mem_get_info 供日志核对。
     """
     import logging
     import os
@@ -132,6 +135,11 @@ def _log_allocator_state() -> None:
     if not torch.cuda.is_available():
         log.info("[allocator] CUDA 不可用，跳过")
         return
+    try:
+        # 显式提高进程显存上限到 95%：解除 cudaMallocAsync 默认 ~16GB pool 限制
+        torch.cuda.set_per_process_memory_fraction(0.95)
+    except Exception as exc:  # pragma: no cover - 仅诊断/兜底
+        log.warning("[allocator] set_per_process_memory_fraction 失败: %s", exc)
     conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "<未设置>")
     try:
         frac = torch.cuda.memory.get_per_process_memory_fraction()
