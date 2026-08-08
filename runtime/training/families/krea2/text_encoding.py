@@ -289,13 +289,102 @@ def _default_model_loader(
     if single is not None:
         return _load_comfy_single_file_te(model_path, single, device, dtype)
     logger.info("加载 Krea2 Qwen3-VL 文本编码器：%s", model_path)
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        str(model_path),
-        dtype=dtype,
-        local_files_only=True,
-        low_cpu_mem_usage=True,
-        device_map={"": str(device)},
+    try:
+        return _load_hf_sharded_te(model_path, device, dtype)
+    except Exception:
+        # 快速路径依赖 safetensors 分片布局；任何解析/加载异常退回
+        # transformers 官方加载（等价旧行为，含 low_cpu_mem_usage 路径）。
+        logger.warning(
+            "HF 分片快速加载失败，回退 transformers from_pretrained：%s",
+            model_path,
+            exc_info=True,
+        )
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            str(model_path),
+            dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            device_map={"": str(device)},
+        )
+        return model.eval().requires_grad_(False)
+
+
+def _load_hf_sharded_te(
+    model_path: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """快速加载 HF 官方分片布局的 Qwen3-VL TE。
+
+    transformers 官方 ``from_pretrained(low_cpu_mem_usage=True)`` 会先建 meta
+    骨架，再对每个权重走 ``_materialize_copy``（``torch.empty`` + ``copy_``，
+    单核 CPU 长时间 100%）。这里与 ``_load_comfy_single_file_te`` 同款：直接
+    用 safetensors 逐张量 ``.to(device, dtype)`` 就位 + ``assign=True`` 替换
+    tensor 对象，跳过 ``_materialize_copy`` 那套重复物化。
+    """
+    import json
+
+    from accelerate import init_empty_weights
+    from safetensors import safe_open
+    from transformers import AutoConfig
+
+    from training.families.krea2.quant_fp8 import _FP8_TORCH_DTYPES  # noqa: PLC0415
+
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"缺少 safetensors 分片索引：{index_path}")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    weight_map: dict[str, str] = index["weight_map"]
+
+    logger.info(
+        "加载 Krea2 Qwen3-VL 文本编码器（HF 分片快速路径）：%s", model_path,
     )
+    config = AutoConfig.from_pretrained(str(model_path), local_files_only=True)
+    # init_empty_weights 默认只把 parameters 放 meta；buffers（rotary
+    # inv_freq 等 non-persistent，不在权重文件里）在 CPU 真实构造带正确值。
+    with init_empty_weights():
+        model = Qwen3VLForConditionalGeneration(config)
+
+    state_dict: dict[str, torch.Tensor] = {}
+    # dict.fromkeys 保留首个出现顺序并去重；safetensors 单线程读文件，
+    # 多分片时串行读即可（物化才是瓶颈，读盘远快于拷贝）。
+    for shard in dict.fromkeys(weight_map.values()):
+        shard_path = model_path / shard
+        with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                tensor = handle.get_tensor(key)
+                if tensor.dtype in _FP8_TORCH_DTYPES:
+                    # fp8 权重原样常驻（无 fp8→bf16 无信息转换），后续
+                    # patch_fp8_linears 挂 dequant 前向。
+                    state_dict[key] = tensor.to(device=device)
+                else:
+                    state_dict[key] = tensor.to(device=device, dtype=dtype)
+
+    result = model.load_state_dict(state_dict, strict=False, assign=True)
+    unexpected = list(result.unexpected_keys)
+    # lm_head 与 embed tied（tie_word_embeddings）——index 里不含该键。
+    missing = [k for k in result.missing_keys if k != "lm_head.weight"]
+    if missing or unexpected:
+        raise ValueError(
+            f"Qwen3-VL HF 分片键不匹配：缺少 {missing[:5]}，多出 {unexpected[:5]}"
+        )
+
+    # 检查覆盖 parameters + buffers（漏 buffer 曾放过 rotary inv_freq 的
+    # meta 残留：编码侥幸能跑，offload 全模型 .to("cpu") 遍历到即崩）。
+    leftover_meta = [
+        name
+        for name, tensor in [
+            *model.named_parameters(), *model.named_buffers(),
+        ]
+        if tensor.device.type == "meta"
+    ]
+    if leftover_meta:
+        raise ValueError(
+            f"Qwen3-VL HF 分片加载后仍有未物化参数：{leftover_meta[:5]}"
+        )
+    # buffers 构造在 CPU（init_empty_weights 只 meta 化参数）——搬到目标
+    # device；参数已 assign 就位，.to() 对其 no-op。
+    model.to(device)
     return model.eval().requires_grad_(False)
 
 
