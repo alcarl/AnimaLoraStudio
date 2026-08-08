@@ -473,11 +473,29 @@ if HAS_TRITON:
         # Quantize input per-row using fused or normal quantization kernel
         if convrot:
             h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-            x_rotated = _rotate_activation(x_2d, h, convrot_groupsize)
-            x_int8, x_scale = triton_quantize_rowwise(x_rotated)
-        else:
+            
+            # --- AMD 专属优化 1: 原地 Hadamard 旋转，避免产生 x_rotated ---
+            n_groups = k // convrot_groupsize
+            x_grouped = x_2d.reshape(-1, n_groups, convrot_groupsize)
+            h = h.to(dtype=x_2d.dtype, device=x_2d.device)
+            # 通过 out= 直接覆盖原显存空间
+            torch.matmul(x_grouped, h, out=x_grouped)
+            
+            # 释放 Hadamard 矩阵并断开引用
+            del h
+            
+            # 此时 x_2d 内部数据已经变成了旋转后的结果
             x_int8, x_scale = triton_quantize_rowwise(x_2d)
 
+        else:
+            x_int8, x_scale = triton_quantize_rowwise(x_2d)
+            
+        # --- AMD 专属优化 2: 提前解除对老高精度激活值的引用 ---
+        # 量化已经完成，x_2d 及其引用的底层显存如果后续不需要，应在此处解除引用
+        # 这一步能让 ROCm 的显存分配器在 output 申请空间前，有更大的连续空闲块
+        del x_2d
+        
+        # 此时申请巨型输出矩阵，显存已经降到最低安全水位
         output = torch.empty((m, n), device=x.device, dtype=out_dtype)
 
         is_per_channel = False
