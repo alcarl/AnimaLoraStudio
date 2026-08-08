@@ -22,6 +22,32 @@ from training.state import load_training_state
 logger = logging.getLogger(__name__)
 
 
+def _clear_sampled_vram() -> None:
+    """清理 baseline 采样留下的显存：cuBLAS workspace（C++ 级常驻，Python gc 不可见）
+    会把 allocator segment 整段钉住，实测采样后 8GB+ reserved 无法被 empty_cache 释放。
+    顺序约束：clear workspace 必须在 empty_cache 之前，segment 才变空闲（daemon 同款，
+    见 anima_daemon._recover_cuda_allocator）。内部 API 缺失/失败时忽略。
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        torch._C._cuda_clearCublasWorkspaces()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def run(ctx: TrainingContext) -> None:
     """
     - init_progress + 可选 Rich Live（含 loss curve panel）
@@ -131,6 +157,12 @@ def run(ctx: TrainingContext) -> None:
             )
     elif ctx.global_step > 0 and sampling_enabled:
         ctx.emit(f"跳过启动基线采样（从 step {ctx.global_step} 恢复，非 step 0）")
+
+    # 采样会重度使用 cuBLAS（SDPA / GEMM），其 C++ 级 workspace 常驻分配会把所在
+    # allocator segment 整段钉住，导致后续第一个 backward 在「还有大量空闲却分不到
+    # 小块」时 OOM（daemon 同款问题，见 anima_daemon._recover_cuda_allocator）。
+    # 进入训练主循环前清理一次，给第一个 backward 留出可增长的 segment。
+    _clear_sampled_vram()
 
     # ADR §8.1 is_pausable 信号：resume phase 全部跑完 → 训练进入主循环 →
     # 允许用户暂停。supervisor `_on_line` 收到此事件后 slot.train_loop_started = True
