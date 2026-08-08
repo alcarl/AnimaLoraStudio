@@ -26,7 +26,12 @@ logger = logging.getLogger(__name__)
 def _resolve_paths(ctx: TrainingContext) -> None:
     args = ctx.args
     ctx.repo_root = find_diffusion_pipe_root()
-    logger.info("模型代码路径: %s", ctx.repo_root)
+    # 注意：repo_root 恒为 modeling/anima（历史 shim，仅作路径解析候选 base，
+    # 见 find_diffusion_pipe_root 注释；模型代码走正常 import，不按此路径加载）。
+    # 因此这里不打印 repo_root 以免误导用户以为在加载 anima 模型；改打真实家族。
+    _fam = getattr(ctx, "family", None)
+    _fam_id = getattr(getattr(_fam, "spec", None), "family_id", None) or _fam
+    logger.info("训练模型族: %s", _fam_id)
 
     phases_dir = Path(__file__).resolve().parent
     training_dir = phases_dir.parent
