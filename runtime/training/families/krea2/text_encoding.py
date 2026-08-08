@@ -346,53 +346,43 @@ def _load_hf_sharded_te(
     with init_empty_weights():
         model = Qwen3VLForConditionalGeneration(config)
 
-    # 并行读分片：safetensors 单文件内张量串行，但不同分片文件可并行读盘/
-    # 解码。bf16 权重 8GB 分几十个张量逐张量 .to(device) 串行 H2D 会累积成
-    # 瓶颈（单核 profiler 100%）。这里分片级并行 + 无 cast 时走纯 device
-    # 搬运，显著摊薄加载时间。
+    # AMD ROCm 下 pageable host 内存 H2D 极慢（实测 0.39GB 1.37s ≈ 285MB/s，
+    # 单核 100%）；pinned memory 走直接 DMA 快 25 倍（0.39GB 0.056s ≈ 7GB/s）。
+    # 所以每个张量先 pin_memory() 再 non_blocking 搬 GPU。bf16 不 cast，fp8
+    # 原样常驻。CPU 只留单张量临时量，不堆整模型。
     import concurrent.futures
 
     shards = list(dict.fromkeys(weight_map.values()))
+    state_dict: dict[str, torch.Tensor] = {}
 
-    def _read_shard(shard: str) -> dict[str, torch.Tensor]:
+    def _read_shard_into(shard: str) -> None:
         shard_path = model_path / shard
-        out: dict[str, torch.Tensor] = {}
-        # 官方分片默认 bf16；此处只负责读回 CPU 张量，搬运到 device 由
-        # 调用方统一做（避免线程里抢 CUDA 上下文锁）。
         with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
             for key in handle.keys():
                 tensor = handle.get_tensor(key)
+                # pin_memory 对已 pinned 源是 no-op；fp8 不做 dtype cast。
+                tensor = tensor.pin_memory()
                 if tensor.dtype in _FP8_TORCH_DTYPES:
-                    out[key] = tensor
+                    tensor = tensor.to(device=device, non_blocking=True)
                 else:
-                    # 已是指定 dtype 则不 cast（bf16→bf16 no-op），只留给
-                    # 后续统一 device 搬运；fp8 原样常驻。
-                    out[key] = tensor.to(dtype=dtype) if tensor.dtype != dtype else tensor
-        return out
+                    tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+                state_dict[key] = tensor
 
-    _t_read = time.perf_counter()
+    _t_load = time.perf_counter()
     n_workers = min(len(shards), 4)
     if n_workers > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
-            shard_states = list(ex.map(_read_shard, shards))
+            # 各分片写 state_dict 的 key 互不重叠，无需加锁。
+            list(ex.map(_read_shard_into, shards))
     else:
-        shard_states = [_read_shard(shards[0])]
-    state_dict: dict[str, torch.Tensor] = {}
-    for chunk in shard_states:
-        state_dict.update(chunk)
+        _read_shard_into(shards[0])
+    # 强制同步，确保全部 H2D 完成再让给 load_state_dict（其内部会做 device
+    # 检查，未同步就 assign 可能踩未完成拷贝）。
+    if device.type != "cpu":
+        torch.cuda.synchronize(device)
     logger.info(
-        "Krea2 TE 分片读取完成：%d 权重，耗时 %.2fs",
-        len(state_dict), time.perf_counter() - _t_read,
-    )
-
-    _t_move = time.perf_counter()
-    state_dict = {
-        key: tensor.to(device=device, non_blocking=True)
-        for key, tensor in state_dict.items()
-    }
-    logger.info(
-        "Krea2 TE 权重搬运到 %s 完成，耗时 %.2fs",
-        device, time.perf_counter() - _t_move,
+        "Krea2 TE 权重加载到 %s 完成：%d 权重，耗时 %.2fs（pinned H2D）",
+        device, len(state_dict), time.perf_counter() - _t_load,
     )
 
     result = model.load_state_dict(state_dict, strict=False, assign=True)
