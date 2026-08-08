@@ -49,18 +49,38 @@ def _checkpoint_path(path: str | Path) -> Path:
     return resolved
 
 
-def _validate_float_input(path: str | Path) -> None:
-    """int8 是加载期动态量化，输入必须是浮点底模；header 只读探测，不读 payload。"""
+def _validate_input(path: str | Path) -> None:
+    """header 只读校验输入底模形态（不读 payload）。
+
+    接受两类输入：
+    1) bf16/fp16/fp32 底模 —— 加载期由 vendored 量化器动态量化为 ConvRot INT8；
+    2) ComfyUI 预量化的 ConvRot INT8 checkpoint —— ``.comfy_quant`` + ``.weight_scale``
+       + int8 ``.weight`` 三元组，由 vendored ``load_and_quantize`` 原地转成 Musubi
+       layout（``.scale_weight``）直接加载。
+
+    只有「已是 int8 权重但缺少 ComfyUI ConvRot 规格（``.comfy_quant``）」的畸形输入才
+    拒绝 —— 这种文件既不能动态量化（权重已非浮点）也不是合法预量化 layout。
+    """
     checkpoint = _checkpoint_path(path)
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+        int8_weights: list[str] = []
+        has_comfy_spec = False
         for key in handle.keys():
-            dtype_str = handle.get_slice(key).get_dtype()
-            if str(dtype_str).upper() in _INT8_DTYPES:
-                raise ValueError(
-                    f"Krea2 int8 loader 输入 {key} 已是 int8 权重（{dtype_str}）："
-                    "本 loader 需要 bf16/fp16 底模做加载期动态量化。"
-                    "若目的是加载预量化 int8 checkpoint，请使用 fp8/bf16 loader 相应路径。"
-                )
+            if key.endswith(quant_int8.COMFY_QUANT_SUFFIX):
+                has_comfy_spec = True
+                continue
+            dtype_str = str(handle.get_slice(key).get_dtype()).upper()
+            if dtype_str in _INT8_DTYPES:
+                int8_weights.append(key)
+    if not int8_weights:
+        return  # 纯浮点底模，正常动态量化
+    if has_comfy_spec:
+        return  # 合法 ComfyUI 预量化 ConvRot INT8，vendored 代码直接加载
+    raise ValueError(
+        f"Krea2 int8 loader 输入 {int8_weights[0]} 已是 int8 权重（I8），但缺少 ComfyUI "
+        "ConvRot 预量化规格（.comfy_quant + .weight_scale）。本 loader 只接受：bf16/fp16 "
+        "底模（加载期动态量化）或 ComfyUI 预量化的 ConvRot INT8 checkpoint。"
+    )
 
 
 def load_krea2_int8_model(
@@ -93,7 +113,7 @@ def load_krea2_int8_model(
         raise ValueError("Krea2 int8 loader 的目标 device 不能是 meta")
 
     checkpoint = _checkpoint_path(path)
-    _validate_float_input(checkpoint)
+    _validate_input(checkpoint)
 
     if config is None:
         config = Krea2Config()

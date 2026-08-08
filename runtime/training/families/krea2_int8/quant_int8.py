@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 #: 默认 ConvRot group size（与 musubi/ComfyUI 一致；为 4 的幂，见 vendor 说明）
 DEFAULT_CONVROT_GROUPSIZE = _vendor.CONVROT_GROUPSIZE
 
+#: ComfyUI 预量化 checkpoint 里标识 ``.comfy_quant`` 规格（JSON spec tensor）的后缀；
+#: loader 用它区分「合法预量化 ConvRot INT8」与「畸形 int8 权重」
+COMFY_QUANT_SUFFIX = _vendor.COMFY_QUANT_SUFFIX
+COMFY_WEIGHT_SCALE_SUFFIX = _vendor.COMFY_WEIGHT_SCALE_SUFFIX
+
 #: 与 fp8 路径对齐的 target/exclude 范围：量化所有主块（blocks.*）里的 Linear 权重，
 #: 排除调制（mod.）、RMSNorm 与文本融合（txtfusion）——后者需保持计算精度。
 INT8_TARGET_KEYS = ["blocks."]

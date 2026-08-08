@@ -6,6 +6,7 @@ int8 权重/scale 布局，以及 int8_base 组合校验（phases/models）。
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,12 @@ from training.families.krea2_int8.loader import (
     load_krea2_int8_model,
 )
 from training.families.krea2_int8.quant_int8 import (
+    COMFY_QUANT_SUFFIX,
     DEFAULT_CONVROT_GROUPSIZE,
     model_has_int8_layers,
+)
+from training.families.krea2_int8.vendor.convrot_int8_kernels import (
+    quantize_int8_convrot_weight,
 )
 
 #: 块内 Linear 的 in_features 需被 256 整除才会被 ConvRot 量化；用 features=256、
@@ -56,6 +61,41 @@ def _write_checkpoint(
     prefix: str = "",
 ) -> None:
     save_file({f"{prefix}{key}": value for key, value in state_dict.items()}, str(path))
+
+
+def _write_comfy_prequantized(
+    path: Path,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    groupsize: int = 256,
+) -> int:
+    """把 bf16 底模转成 ComfyUI 预量化 ConvRot INT8 layout（.weight int8 + .weight_scale
+    + .comfy_quant 三元组），返回量化层数。镜像 vendored 量化器的动态输出，再套 ComfyUI 命名。
+    """
+    out: dict[str, torch.Tensor] = {}
+    count = 0
+    for key, value in state_dict.items():
+        is_target = (
+            "blocks." in key
+            and key.endswith(".weight")
+            and not any(e in key for e in ("mod.", "norm", "txtfusion"))
+        )
+        if is_target and value.ndim == 2 and value.shape[1] % groupsize == 0:
+            quantized, scale = quantize_int8_convrot_weight(value, groupsize)
+            module = key[: -len(".weight")]
+            out[key] = quantized
+            out[f"{module}.weight_scale"] = scale
+            spec = json.dumps(
+                {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": groupsize}
+            ).encode("utf-8")
+            out[f"{module}{COMFY_QUANT_SUFFIX}"] = torch.tensor(
+                list(spec), dtype=torch.uint8
+            )
+            count += 1
+        else:
+            out[key] = value
+    save_file(out, str(path))
+    return count
 
 
 def test_load_int8_quantizes_and_freezes(tmp_path: Path) -> None:
@@ -113,8 +153,8 @@ def test_load_int8_detects_base(tmp_path: Path) -> None:
     assert model_has_int8_layers(model) is True
 
 
-def test_load_int8_rejects_prequantized_int8_input(tmp_path: Path) -> None:
-    """loader 的输入必须是 bf16/fp16 底模；已是 int8 的输入直接拒绝。"""
+def test_load_int8_rejects_malformed_int8_without_comfy_spec(tmp_path: Path) -> None:
+    """int8 权重但缺 .comfy_quant 规格 → 畸形输入，拒绝（既不能动态量化也非合法预量化）。"""
     config = _int8_tiny_config()
     sd = _state_dict(config)
     sd["blocks.0.attn.wq.weight"] = torch.zeros(
@@ -124,8 +164,54 @@ def test_load_int8_rejects_prequantized_int8_input(tmp_path: Path) -> None:
     save_file(sd, str(checkpoint))
 
     assert checkpoint_contains_int8(checkpoint) is True
-    with pytest.raises(ValueError, match="已是 int8"):
+    with pytest.raises(ValueError, match="已是 int8 权重"):
         load_krea2_int8_model(checkpoint, device="cpu", dtype=torch.bfloat16, config=config)
+
+
+def test_load_int8_accepts_comfy_prequantized(tmp_path: Path) -> None:
+    """合法 ComfyUI 预量化 ConvRot INT8 checkpoint（.comfy_quant 三元组）直接加载，
+    不需要重新量化——vendored 代码原地转成 Musubi layout。"""
+    config = _int8_tiny_config()
+    checkpoint = tmp_path / "prequant.safetensors"
+    quantized_layers = _write_comfy_prequantized(checkpoint, _state_dict(config))
+
+    assert quantized_layers >= 1
+    assert checkpoint_contains_int8(checkpoint) is True
+    model = load_krea2_int8_model(
+        checkpoint, device="cpu", dtype=torch.bfloat16, config=config
+    )
+
+    assert model.convrot_int8_layer_count == quantized_layers
+    assert getattr(model, "is_convrot_int8", False) is True
+    assert all(not p.requires_grad for p in model.parameters())
+    wq = model.blocks[0].attn.wq
+    assert wq.weight.dtype == torch.int8
+    assert hasattr(wq, "scale_weight")
+    assert tuple(wq.scale_weight.shape) == (wq.out_features, 1)
+
+
+def test_load_int8_comfy_prequantized_forward(tmp_path: Path) -> None:
+    """预量化加载后的模型能正常前向（fused ConvRot INT8 forward）。"""
+    config = _int8_tiny_config()
+    checkpoint = tmp_path / "prequant.safetensors"
+    _write_comfy_prequantized(checkpoint, _state_dict(config))
+
+    model = load_krea2_int8_model(
+        checkpoint, device="cpu", dtype=torch.bfloat16, config=config
+    )
+    batch, c, h, w = 2, config.channels, 16, 16
+    x = torch.randn(batch, c, h, w, dtype=torch.bfloat16)
+    timesteps = torch.rand(batch, dtype=torch.bfloat16)
+    context = torch.randn(
+        batch, 6, config.txtlayers * config.txtdim, dtype=torch.bfloat16
+    )
+    attention_mask = torch.ones(batch, 6, dtype=torch.bool)
+
+    with torch.no_grad():
+        out = model(x, timesteps, context, attention_mask=attention_mask)
+
+    assert tuple(out.shape) == (batch, c, h, w)
+    assert torch.isfinite(out).all()
 
 
 def test_load_int8_rejects_block_swap(tmp_path: Path) -> None:
