@@ -326,7 +326,7 @@ def _load_hf_sharded_te(
 
     from accelerate import init_empty_weights
     from safetensors import safe_open
-    from transformers import AutoConfig
+    from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 
     from training.families.krea2.quant_fp8 import _FP8_TORCH_DTYPES  # noqa: PLC0415
 
