@@ -115,6 +115,38 @@ from training.loss_weighting import compute_loss_weight  # noqa: E402
 # 主函数
 # ============================================================================
 
+
+def _log_allocator_state() -> None:
+    """打印实际生效的 CUDA 分配器配置，用于定位「显存充足却分不到小块」的 OOM。
+
+    关键：expandable_segments 只在 ``PYTORCH_CUDA_ALLOC_CONF`` 在 torch import 前被读到
+    才生效；若环境变量被残留值覆盖或平台不支持（TORCH_WARN_ONCE 后强制关闭），
+    这里会与预期不符。同时打印 memory fraction，排除外部库把进程显存限死。
+    """
+    import logging
+    import os
+
+    import torch
+
+    log = logging.getLogger(__name__)
+    if not torch.cuda.is_available():
+        log.info("[allocator] CUDA 不可用，跳过")
+        return
+    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "<未设置>")
+    try:
+        frac = torch.cuda.memory.get_per_process_memory_fraction()
+    except Exception as exc:  # pragma: no cover - 仅诊断
+        frac = f"<err {exc}>"
+    free, total = torch.cuda.mem_get_info()
+    log.info(
+        "[allocator] PYTORCH_CUDA_ALLOC_CONF=%s | memory_fraction=%s | mem_free=%sGiB total=%sGiB",
+        conf,
+        frac,
+        round(free / (1024**3), 2),
+        round(total / (1024**3), 2),
+    )
+
+
 def main():
     """ADR 0003 PR-B：main() 现在只编排 phase。
 
@@ -128,6 +160,7 @@ def main():
     args = parse_args()
     ctx = TrainingContext(args=args)
     phases.bootstrap.run(ctx)
+    _log_allocator_state()
     phases.models.run(ctx)
     phases.dataset.run(ctx)
     phases.text_cache.run(ctx)
