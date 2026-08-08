@@ -48,7 +48,7 @@ class GenerateConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # 模型族（服务端从请求填充；daemon 按此派发加载与采样栈）
-    model_family: Literal["anima", "krea2"] = Field("anima")
+    model_family: Literal["anima", "krea2", "krea2_int8"] = Field("anima")
     # 蒸馏推理底模（Krea2 Turbo：8 步 / guidance 0 / mu 固定 1.15）。
     # 服务端按 catalog variant purpose 检测官方 Turbo 路径后注入
     distilled: bool = Field(False)

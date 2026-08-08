@@ -188,13 +188,21 @@ class LycorisAdapter:
         # LoKr takes the rebuild path. That path casts the dense LoKr delta to
         # the raw base-weight dtype; torch has no float8 mul/add kernels for it.
         # Bypass preserves the patched base forward and computes LoKr separately.
-        has_fp8_base = any(
-            isinstance(module, nn.Linear) and module.weight.dtype in _FP8_DTYPES
+        # The same holds for the Krea2 int8 (ConvRot) base: its patched Linear
+        # holds an int8 weight (rotated basis) + a `scale_weight` buffer and runs
+        # a custom autograd.Function with no bf16/fp16 rebuild path.
+        has_quantized_base = any(
+            isinstance(module, nn.Linear)
+            and (
+                module.weight.dtype in _FP8_DTYPES
+                or module.weight.dtype == torch.int8
+                or hasattr(module, "scale_weight")
+            )
             for module in model.modules()
         )
-        if self.algo == "lokr" and has_fp8_base:
+        if self.algo == "lokr" and has_quantized_base:
             extra["bypass_mode"] = True
-            logger.info("FP8 base detected: forcing LoKr bypass forward")
+            logger.info("Quantized (fp8/int8) base detected: forcing LoKr bypass forward")
 
         with _suppress_lokr_dropout_spam() as _dropout_filter:
             self.network = LycorisNetwork(

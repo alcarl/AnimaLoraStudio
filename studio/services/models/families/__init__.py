@@ -1,8 +1,8 @@
 """模型族资产 registry（studio 侧三居所之一，多模型 PR-4）。
 
-与 runtime `training/families` 的 SPECS 共用族名 join key（"anima" / "krea2"）。
-下载资产允许先于训练实现落地，测试保证所有 runtime 族都有对应资产清单。
-判定标准（01 §8.1）：出现在
+与 runtime `training/families` 的 SPECS 共用族名 join key（"anima" / "krea2" /
+"krea2_int8"）。下载资产允许先于训练实现落地，测试保证所有 runtime 族都有对应
+资产清单。判定标准（01 §8.1）：出现在
 TrainingConfig 权重路径字段里的是「模型族资产」进本包；打标 / 放大 / 评估 /
 预览解码等「工具模型」永远留在 ..paths。
 
@@ -12,6 +12,9 @@ TrainingConfig 权重路径字段里的是「模型族资产」进本包；打�
 - transformer_path_for(sel) — 显式底模选择 → transformer 绝对路径
 - selected_variant() — Settings 当前选中 variant
 - catalog_sections(root, models_cfg) — /api/models/catalog 的本族区块
+
+``krea2_int8`` 复用 ``krea2`` 的资产：int8 底模是同一批 bf16 raw 权重在训练加载期
+动态 ConvRot 量化而来，下载清单与路径完全一致（不需要单独一份官方 raw 下载源）。
 """
 from __future__ import annotations
 
@@ -23,6 +26,8 @@ from . import krea2 as _krea2
 FAMILY_ASSETS = {
     "anima": _anima.ASSETS,
     "krea2": _krea2.ASSETS,
+    # int8 是 krea2 底模的加载期量化形态，共用 bf16 raw 下载资产
+    "krea2_int8": _krea2.ASSETS,
 }
 
 

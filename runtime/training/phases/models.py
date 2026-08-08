@@ -260,6 +260,48 @@ def _validate_fp8_base(ctx: TrainingContext) -> None:
     )
 
 
+def _validate_int8_base(ctx: TrainingContext) -> None:
+    """int8（ConvRot INT8）底模训练的组合校验——fail-fast 于任何大加载之前。
+
+    int8 与 fp8 同属「底模量化 + LoRA 全精度」的 kohya/musubi 语义（int8_base），
+    且 int8 的显存收益同样依赖 grad checkpointing 释放 per-layer 反量化临时权重。
+    因为 int8 底模由 ``krea2_int8`` 家族在加载期动态量化产生（而非预量化文件），
+    这里按族触发而非 header 探测，约束与 fp8 对齐：
+
+    - grad_checkpoint 必须开。
+    - DoRA 不支持：初始化读底模权重数值，int8 旋转基 + scale 下数值不正确。
+    - block swap 不支持：int8 权重需加载期动态量化，CPU 流式编排未接线。
+    """
+    args = ctx.args
+    family_id = getattr(ctx.family, "spec", None) and ctx.family.spec.family_id
+    if family_id != "krea2_int8":
+        return
+    problems = []
+    if not bool(getattr(args, "grad_checkpoint", True)):
+        problems.append(
+            "grad_checkpoint=false：int8 底模的逐层反量化临时权重会被 "
+            "autograd 全量驻留，显存占用反超 bf16。请开启梯度检查点。"
+        )
+    if bool(getattr(args, "lora_dora", False)):
+        problems.append(
+            "lora_dora=true：DoRA 初始化读取底模权重数值，int8 旋转基存储下"
+            "数值不正确。请关闭 DoRA 或改用 bf16 底模。"
+        )
+    if int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
+        problems.append(
+            "blocks_to_swap>0：int8（ConvRot）底模需在加载期动态量化，"
+            "block swap 的 CPU 流式编排尚未接线。请关闭 block swap 使用 int8 训练。"
+        )
+    if problems:
+        raise RuntimeError(
+            "int8 底模与当前配置不兼容：\n- " + "\n- ".join(problems)
+        )
+    logger.info(
+        "krea2_int8 家族：以 int8_base 语义训练（底模动态量化 ConvRot INT8 并冻结，"
+        "前向走 fused INT8 GEMM，LoRA 参数全精度）"
+    )
+
+
 def run(ctx: TrainingContext) -> None:
     """Resolve paths and load either the complete stack or the cache-first half."""
     from training.sysmem import check_load_budget, guard_enabled_from_env
@@ -268,6 +310,7 @@ def run(ctx: TrainingContext) -> None:
         ctx.family = resolve_family(ctx.args)
     _resolve_paths(ctx)
     _validate_fp8_base(ctx)
+    _validate_int8_base(ctx)
 
     if _defer_dit_for_text_cache(ctx):
         logger.info(

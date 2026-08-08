@@ -197,6 +197,39 @@ def test_adapter_lokr_fp8_base_forces_bypass_and_trains() -> None:
     assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
+def test_adapter_lokr_int8_base_forces_bypass_and_trains() -> None:
+    """Monkeypatched ConvRot INT8 nn.Linear uses bypass and full-precision LoKr params."""
+    from training.families.krea2_int8.quant_int8 import patch_convrot_int8_linears
+
+    torch.manual_seed(0)
+    model = MockDiT(d=256)  # d 需被默认 ConvRot group size 256 整除
+    # 模拟 ConvRot INT8 底模：int8 权重（旋转基）+ fp32 scale_weight buffer + fused 前向
+    fake_sd: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            w = module.weight.detach().float()
+            q = (w / w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) * 127).round().clamp(-128, 127).to(torch.int8)
+            scale = (w.abs().amax(dim=-1, keepdim=True).float() / 127.0).clamp(min=1e-6)
+            fake_sd[f"{name}.weight"] = q
+            fake_sd[f"{name}.scale_weight"] = scale
+    patch_convrot_int8_linears(model, fake_sd, bwd_mode="bf16")
+
+    adapter = AnimaLycorisAdapter(
+        preset=KREA2_PRESET, algo="lokr", rank=4, alpha=4, factor=4,
+    )
+    adapter.inject(model)
+
+    modes = _bypass_modes(adapter)
+    assert modes and all(modes)
+    params = adapter.get_params()
+    assert params and all(p.dtype == torch.float32 for p in params)
+
+    output = model.q_proj(torch.randn(2, 3, 256))
+    output.square().mean().backward()
+    grads = [p.grad for p in params if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
 def test_adapter_loha_keeps_rebuild() -> None:
     """algo='loha' 行为不变（LoHa bypass 内部仍 rebuild，开了反而慢；lycoris changelog 原话）"""
     torch.manual_seed(0)

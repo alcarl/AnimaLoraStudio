@@ -133,10 +133,10 @@ def test_option_gates_render_expressions():
     assert sampling_option_gates("samplers") == {
         "er_sde": "model_family==anima",
         "dpmpp_3m_sde": "model_family==anima",
-        "euler": "model_family==krea2",
+        "euler": "model_family==krea2||model_family==krea2_int8",
     }
     assert option_gates(TIMESTEP_SAMPLING_OPTION_FAMILIES) == {
-        "krea2_shift": "model_family==krea2",
+        "krea2_shift": "model_family==krea2||model_family==krea2_int8",
     }
 
 

@@ -246,6 +246,26 @@
     stochastic_rounding_fp8`；seed 的 CRC-32 口径来自 `comfy/utils.py
     string_to_seed`（以 zlib.crc32 等价实现）——公式级对照，未复制代码结构
 
+#### vendored：ConvRot INT8 底模（直接复制，仅改写 import 路径）
+
+int8 底模训练（`krea2_int8` 家族）的量化/前向/加载代码**直接复制**自
+musubi-tuner（Apache-2.0，固定 commit 同上），置于自包含的 vendored 包
+`runtime/training/families/krea2_int8/vendor/`；业务封装见
+`quant_int8.py` / `loader.py`。复制文件与上游映射：
+
+- `vendor/convrot_int8_kernels.py` ← `src/musubi_tuner/modules/convrot_int8_kernels.py`
+  （ConvRot 正则 Hadamard 旋转 + 行内 INT8 + Triton 融合 GEMM/反量化；Triton 缺失时
+  eager 退化路径）。该文件本身 vendored 自 Comfy-Org/comfy-kitchen 与 dxqb/OneTrainer、
+  ComfyUI-Flux2-INT8，Apache-2.0，头部保留 SPDX）
+- `vendor/convrot_int8_utils.py` ← `src/musubi_tuner/modules/convrot_int8_utils.py`
+  （`ConvRotInt8Quantizer` 流式量化器 + `nn.Linear` 前向 monkey-patch +
+  `ConvRotInt8LinearFn` autograd）
+- `vendor/safetensors_utils.py` ← `src/musubi_tuner/utils/safetensors_utils.py`
+  （`MemoryEfficientSafeOpen` / `TensorWeightAdapter` / `WeightTransformHooks`）
+- `vendor/device_utils.py` ← `src/musubi_tuner/utils/device_utils.py`
+
+上游原生文件头版权/许可声明均保留，未删改。
+
 实现按本项目 timestep sampler protocol / 纯 torch modeling 边界适配；具体派生关系见各文件头。
 
 ---

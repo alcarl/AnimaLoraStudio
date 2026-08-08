@@ -48,7 +48,7 @@ class TrainingConfig(BaseModel):
     # 相对路径解析（与历史行为一致）。
     # 一级决策不藏高级区（P4-3）。前端对该字段的变更做「切换动作」拦截：
     # 经 /api/models/family-switch 重算路径 + 重置族风味字段 + 确认后才写。
-    model_family: Literal["anima", "krea2"] = Field(
+    model_family: Literal["anima", "krea2", "krea2_int8"] = Field(
         "anima",
         description="模型族。决定训练走哪套模型实现；其余字段按族能力自动显隐。切换将重算模型路径并重置族相关默认值",
         json_schema_extra=_meta("model"),

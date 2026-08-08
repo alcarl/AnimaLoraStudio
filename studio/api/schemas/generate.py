@@ -23,7 +23,7 @@ class GenerateRequest(BaseModel):
     mixed_precision: str = "bf16"
     # 底模所属模型族（多模型 P4-4）：决定路径解析 / daemon 加载与采样栈；
     # sampler 按族白名单校验（GenerateConfig validator，越族 422）
-    model_family: Literal["anima", "krea2"] = "anima"
+    model_family: Literal["anima", "krea2", "krea2_int8"] = "anima"
     # 本次出图临时选用的底模（官方 variant key 或注册的本地 custom 路径）；
     # None → 用 Settings 里该族 selected。只换 transformer 权重。
     base_model: Optional[str] = None

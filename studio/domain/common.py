@@ -24,6 +24,7 @@ FAMILY_CAPABILITIES: dict[str, frozenset] = {
         "caption_tag_ops", "online_text", "masked_loss", "block_swap",
     }),
     "krea2": frozenset({"masked_loss", "text_cache", "block_swap"}),
+    "krea2_int8": frozenset({"masked_loss", "text_cache", "int8_base"}),
 }
 
 # 族默认 overlay 的单一权威源（ModelSpec.config_defaults 直接引用本表，R3）。
@@ -32,6 +33,19 @@ FAMILY_CAPABILITIES: dict[str, frozenset] = {
 FAMILY_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
     "anima": {},
     "krea2": {
+        "shuffle_caption": False,
+        "keep_tokens": 0,
+        "tag_dropout": 0.0,
+        "text_encoder_cache": True,
+        "attention_backend": "none",
+        "timestep_sampling": "krea2_shift",
+        "timestep_shift_resolution_aware": False,
+        "sample_sampler_name": "euler",
+        "sample_scheduler": "simple",
+        "sample_infer_steps": 28,
+        "sample_cfg_scale": 4.5,
+    },
+    "krea2_int8": {
         "shuffle_caption": False,
         "keep_tokens": 0,
         "tag_dropout": 0.0,
@@ -67,6 +81,11 @@ FAMILY_SAMPLING: dict[str, dict[str, tuple[str, ...]]] = {
         "samplers": ("euler",),
         "schedulers": ("simple",),
     },
+    # int8 与 krea2 同架构同采样口径，复用同一白名单
+    "krea2_int8": {
+        "samplers": ("euler",),
+        "schedulers": ("simple",),
+    },
 }
 
 #: Literal 收紧（#256）前就存在的族：sampler/scheduler 白名单外的存量值按
@@ -80,7 +99,7 @@ LEGACY_SAMPLING_FAMILIES: frozenset = frozenset({"anima"})
 #: token_counts），但 mu 插值按 K2 校准——只做 UI 引导性隐藏，后端不设闸
 #: （A1：同代码不限制）。第 3 个 resolution-aware 族复用该策略时加进元组即可。
 TIMESTEP_SAMPLING_OPTION_FAMILIES: dict[str, tuple[str, ...]] = {
-    "krea2_shift": ("krea2",),
+    "krea2_shift": ("krea2", "krea2_int8"),
 }
 
 
