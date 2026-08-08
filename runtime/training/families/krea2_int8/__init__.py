@@ -86,6 +86,7 @@ class Krea2Int8Family(Krea2Family):
                  attention_backend: str = "flash_attn", repo_root=None,
                  purpose: str = "train", blocks_to_swap: int = 0):
         from training.families.krea2_int8.loader import load_krea2_int8_model
+        from training.families.krea2_int8.quant_int8 import disable_convrot_autotune
         from training.families.krea2_int8.vendor.convrot_int8_kernels import HAS_TRITON
 
         if attention_backend != "none":
@@ -93,6 +94,10 @@ class Krea2Int8Family(Krea2Family):
                 "Krea2 int8 当前固定使用 PyTorch SDPA；忽略 attention_backend=%s",
                 attention_backend,
             )
+        # 固定 Triton GEMM config、跳过 autotune 的 do_bench：消掉显存贴近上限时
+        # `torch.empty(cache_size//4)` 的瞬时分配尖峰（backward + grad checkpoint
+        # 重算阶段实测会把 24GB 卡顶爆）。须在首次 GEMM 前调用。
+        disable_convrot_autotune()
         # backward 反向：triton 可用时走 "int8" 融合 GEMM（更快且省显存——不物化 bf16
         # 反量化权重拷贝），否则回退 "bf16" 瞬时反量化。
         bwd_mode = "int8" if HAS_TRITON else "bf16"

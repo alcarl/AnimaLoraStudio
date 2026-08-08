@@ -28,6 +28,7 @@ from typing import Sequence
 import torch
 
 from training.families.krea2_int8.vendor import convrot_int8_utils as _vendor
+from training.families.krea2_int8.vendor import convrot_int8_kernels as _kernels
 from training.families.krea2_int8.vendor.convrot_int8_kernels import HAS_TRITON
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,36 @@ INT8_EXCLUDE_KEYS = ["mod.", "norm", "txtfusion"]
 def convrot_available() -> bool:
     """是否可用 Triton 融合 INT8 核（不可用时退化为 eager dequant 路径）。"""
     return HAS_TRITON
+
+
+#: triton @triton.autotune 包装的 ConvRot INT8 GEMM 核（vendored 里各 7 个 config）。
+#: autotuner 只在 len(configs) > 1 时跑 do_bench——do_bench 会先 `torch.empty(cache_size//4)`
+#: 分配一块大空显存来 flush 缓存再计时。训练 backward + grad checkpoint 重算阶段显存贴近
+#: 上限时，这个瞬时大块分配会把峰值顶爆（24GB 卡 batch=1 的 Krea2 int8 实测 76MiB 请求 OOM）。
+#: 保留 autotune 会为了每个 (m,n,k) 形状在首次出现时反复触发该尖峰。
+_AUTOTUNED_KERNELS = ("_int8_matmul_dequant_kernel", "_int8_matmul_dequant_per_row_kernel")
+
+
+def disable_convrot_autotune() -> None:
+    """把 vendored 的 ConvRot INT8 GEMM 核固定为首个 config，跳过 Triton autotune。
+
+    triton 3.x 的 Autotuner 在 ``len(self.configs) > 1`` 时才会 benchmark；把
+    ``configs`` 截成 1 个后走 ``configs[0]`` 直通，**不再跑 do_bench**，从而消掉
+    autotune 在显存贴近上限时 `torch.empty(cache_size//4)` 的瞬时分配尖峰。
+    代价是固定 config（首个通常是最大的 128×256×64，对 Krea2 大层足够好）。
+
+    幂等：多次调用 / 已被截断都安全。只在 triton 可用时有效。
+    """
+    if not HAS_TRITON:
+        return
+    for name in _AUTOTUNED_KERNELS:
+        kernel = getattr(_kernels, name, None)
+        if kernel is None:
+            continue
+        configs = getattr(kernel, "configs", None)
+        if configs is not None and len(configs) > 1:
+            kernel.configs = configs[:1]
+            logger.info("ConvRot INT8：已固定 Triton GEMM 核 %s 为固定 config，跳过 autotune", name)
 
 
 def build_convrot_quantizer(
