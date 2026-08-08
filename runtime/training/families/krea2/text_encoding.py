@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -345,20 +346,54 @@ def _load_hf_sharded_te(
     with init_empty_weights():
         model = Qwen3VLForConditionalGeneration(config)
 
-    state_dict: dict[str, torch.Tensor] = {}
-    # dict.fromkeys 保留首个出现顺序并去重；safetensors 单线程读文件，
-    # 多分片时串行读即可（物化才是瓶颈，读盘远快于拷贝）。
-    for shard in dict.fromkeys(weight_map.values()):
+    # 并行读分片：safetensors 单文件内张量串行，但不同分片文件可并行读盘/
+    # 解码。bf16 权重 8GB 分几十个张量逐张量 .to(device) 串行 H2D 会累积成
+    # 瓶颈（单核 profiler 100%）。这里分片级并行 + 无 cast 时走纯 device
+    # 搬运，显著摊薄加载时间。
+    import concurrent.futures
+
+    shards = list(dict.fromkeys(weight_map.values()))
+
+    def _read_shard(shard: str) -> dict[str, torch.Tensor]:
         shard_path = model_path / shard
+        out: dict[str, torch.Tensor] = {}
+        # 官方分片默认 bf16；此处只负责读回 CPU 张量，搬运到 device 由
+        # 调用方统一做（避免线程里抢 CUDA 上下文锁）。
         with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
             for key in handle.keys():
                 tensor = handle.get_tensor(key)
                 if tensor.dtype in _FP8_TORCH_DTYPES:
-                    # fp8 权重原样常驻（无 fp8→bf16 无信息转换），后续
-                    # patch_fp8_linears 挂 dequant 前向。
-                    state_dict[key] = tensor.to(device=device)
+                    out[key] = tensor
                 else:
-                    state_dict[key] = tensor.to(device=device, dtype=dtype)
+                    # 已是指定 dtype 则不 cast（bf16→bf16 no-op），只留给
+                    # 后续统一 device 搬运；fp8 原样常驻。
+                    out[key] = tensor.to(dtype=dtype) if tensor.dtype != dtype else tensor
+        return out
+
+    _t_read = time.perf_counter()
+    n_workers = min(len(shards), 4)
+    if n_workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+            shard_states = list(ex.map(_read_shard, shards))
+    else:
+        shard_states = [_read_shard(shards[0])]
+    state_dict: dict[str, torch.Tensor] = {}
+    for chunk in shard_states:
+        state_dict.update(chunk)
+    logger.info(
+        "Krea2 TE 分片读取完成：%d 权重，耗时 %.2fs",
+        len(state_dict), time.perf_counter() - _t_read,
+    )
+
+    _t_move = time.perf_counter()
+    state_dict = {
+        key: tensor.to(device=device, non_blocking=True)
+        for key, tensor in state_dict.items()
+    }
+    logger.info(
+        "Krea2 TE 权重搬运到 %s 完成，耗时 %.2fs",
+        device, time.perf_counter() - _t_move,
+    )
 
     result = model.load_state_dict(state_dict, strict=False, assign=True)
     unexpected = list(result.unexpected_keys)
@@ -368,6 +403,11 @@ def _load_hf_sharded_te(
         raise ValueError(
             f"Qwen3-VL HF 分片键不匹配：缺少 {missing[:5]}，多出 {unexpected[:5]}"
         )
+    # lm_head 与 embed tied——index 不含该键；transformers 的 tie_weights()
+    # 对 meta 构造 + assign 加载不重绑，手动指回 embed（零拷贝）。
+    out_emb = model.get_output_embeddings()
+    if out_emb is not None and out_emb.weight.device.type == "meta":
+        out_emb.weight = model.get_input_embeddings().weight
 
     # 检查覆盖 parameters + buffers（漏 buffer 曾放过 rotary inv_freq 的
     # meta 残留：编码侥幸能跑，offload 全模型 .to("cpu") 遍历到即崩）。
