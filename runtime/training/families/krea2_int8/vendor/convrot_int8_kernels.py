@@ -339,9 +339,17 @@ if HAS_TRITON:
         pid_n = (pid % num_pid_in_group) // actual_group_size_m
 
         # 1. Prepare Pointers for A and B
-        offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-        offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
+        # 注意：不取模！取模会让最后一块越界索引回绕到前面的行，导致：
+        #   - 加载 A/scale 时读到错误（回绕）行的数据
+        #   - 存储时把本应屏蔽的越界行错误写回合法区
+        # 正确做法是保留原始偏移，并在加载/存储处用 mask 屏蔽越界（越界读 other=0，
+        # 越界写不写入）。这是 musubi-tuner 官方 Triton GEMM 的标准边界处理。
+        offs_am = pid_m * block_m + tl.arange(0, block_m)
+        offs_bn = pid_n * block_n + tl.arange(0, block_n)
         offs_k = tl.arange(0, block_k)
+
+        am_mask = offs_am[:, None] < m
+        bn_mask = offs_bn[None, :] < n
 
         a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -350,9 +358,9 @@ if HAS_TRITON:
         accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
 
         for k_idx in range(0, tl.cdiv(k, block_k)):
-            # Load chunks
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
+            # Load chunks（k 方向 + m/n 方向同时 mask，越界读 0）
+            a = tl.load(a_ptrs, mask=am_mask & (offs_k[None, :] < k - k_idx * block_k), other=0)
+            b = tl.load(b_ptrs, mask=bn_mask & (offs_k[:, None] < k - k_idx * block_k), other=0)
 
             # Matrix Multiply
             accumulator += tl.dot(a, b)
@@ -362,7 +370,7 @@ if HAS_TRITON:
             b_ptrs += block_k * stride_bk
 
         # 3. Fused Epilogue (Dequantize & Bias)
-        scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
+        scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < m, other=0.0)  # Vector [BLOCK_M]
         scale_b = tl.load(b_scale_ptr)
 
         c = accumulator.to(tl.float32)
@@ -370,12 +378,12 @@ if HAS_TRITON:
         c = c * total_scale
 
         if has_bias:
-            bias = tl.load(bias_ptr + offs_bn)  # Vector [BLOCK_N]
+            bias = tl.load(bias_ptr + offs_bn, mask=offs_bn < n, other=0.0)  # Vector [BLOCK_N]
             c = c + bias[None, :]
 
         # 4. Store Result
         c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-        c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
+        c_mask = am_mask & bn_mask
         tl.store(c_ptrs, c, mask=c_mask)
 
     @triton.autotune(
@@ -432,9 +440,14 @@ if HAS_TRITON:
         pid_n = (pid % num_pid_in_group) // actual_group_size_m
 
         # 1. Prepare Pointers for A and B
-        offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-        offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
+        # 不取模！取模会让最后一块越界索引回绕到前面的行（详见上方的 _int8_matmul_dequant_kernel
+        # 注释），用 mask 屏蔽越界即可。
+        offs_am = pid_m * block_m + tl.arange(0, block_m)
+        offs_bn = pid_n * block_n + tl.arange(0, block_n)
         offs_k = tl.arange(0, block_k)
+
+        am_mask = offs_am[:, None] < m
+        bn_mask = offs_bn[None, :] < n
 
         a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -443,27 +456,27 @@ if HAS_TRITON:
         accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
 
         for k_idx in range(0, tl.cdiv(k, block_k)):
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
+            a = tl.load(a_ptrs, mask=am_mask & (offs_k[None, :] < k - k_idx * block_k), other=0)
+            b = tl.load(b_ptrs, mask=bn_mask & (offs_k[:, None] < k - k_idx * block_k), other=0)
             accumulator += tl.dot(a, b)
             a_ptrs += block_k * stride_ak
             b_ptrs += block_k * stride_bk
 
         # 3. Fused Epilogue (Dequantize & Bias)
-        scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
-        scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
+        scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < m, other=0.0)  # Vector [BLOCK_M]
+        scale_b = tl.load(b_scale_ptr + offs_bn, mask=offs_bn < n, other=0.0)  # Vector [BLOCK_N]
 
         c = accumulator.to(tl.float32)
         total_scale = scale_a[:, None] * scale_b[None, :]
         c = c * total_scale
 
         if has_bias:
-            bias = tl.load(bias_ptr + offs_bn)
+            bias = tl.load(bias_ptr + offs_bn, mask=offs_bn < n, other=0.0)
             c = c + bias[None, :]
 
         # 4. Store Result
         c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-        c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
+        c_mask = am_mask & bn_mask
         tl.store(c_ptrs, c, mask=c_mask)
 
     def int8_linear(
