@@ -26,7 +26,6 @@ import logging
 import os
 import signal
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -1269,13 +1268,9 @@ class Supervisor:
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONUNBUFFERED", "1")
-        # 训练子进程的 CUDA 分配器：显存贴近上限时（如 krea2_int8 底模 backward +
-        # grad checkpoint 重算阶段）默认 caching allocator 会因碎片化在「还有大量
-        # 空闲却分不到小块」时 OOM。expandable_segments 用可扩展内存段显著降低碎片。
-        # 在子进程 env 里显式 setdefault，确保不依赖 anima_train.py 顶部执行顺序；
-        # 只在 Linux 设（Windows wheel 不含该 backend，会 TORCH_WARN 并强制关闭）。
-        if sys.platform.startswith("linux"):
-            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # 注意：不要在这里注入 PYTORCH_CUDA_ALLOC_CONF=expandable_segments。expandable_segments
+        # 是纯 CUDA(NVIDIA) 特性，在 AMD ROCm(HIP) 上有 bug（hipMalloc 异常、模型 .to(device)
+        # 就 OOM）。本项目同时支持 NVIDIA 与 AMD 卡，CUDA 用户需要时自行在启动前设置该变量。
         # 减少底层库的加载进度条（safetensors / transformers / accelerate 等
         # 在 stdout=pipe 时会逐行打几百行 `Loading weights: NN%|...`，淹没用户
         # 自己的训练日志）。仅静音「加载进度」，不影响 logger.error / 训练步进。

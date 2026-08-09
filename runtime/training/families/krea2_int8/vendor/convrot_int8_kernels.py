@@ -67,6 +67,9 @@ _HADAMARD_CACHE = {}
 #: 又不至于因 Triton 多次启动而太慢。
 _INT8_CHUNK_BUDGET_BYTES = 128 * 1024 * 1024
 
+#: 一次性分块日志标志（避免每个 int8_linear 调用都打日志刷屏）
+_int8_chunk_logged = False
+
 
 def _build_hadamard(
     size: int,
@@ -515,6 +518,15 @@ if HAS_TRITON:
         #     单次分配大幅变小，降低 OOM 概率。 ---
         # 每行预算：k 个元素（bf16 旋转激活 2B + int8 量化 1B，留 int32 中间余量 ~4B）
         chunk_m = max(1, min(m, _INT8_CHUNK_BUDGET_BYTES // max(1, k * 4)))
+        # 一次性日志，确认 AMD 分块路径是否启动
+        global _int8_chunk_logged
+        if not _int8_chunk_logged:
+            _int8_chunk_logged = True
+            import logging
+            logging.getLogger(__name__).info(
+                "ConvRot INT8 分块启动: m=%d k=%d n=%d chunk_m=%d (%d chunks)",
+                m, k, n, chunk_m, (m + chunk_m - 1) // chunk_m,
+            )
         output = torch.empty((m, n), device=x.device, dtype=out_dtype)
 
         def grid(meta):

@@ -17,16 +17,15 @@ import os
 import sys
 from pathlib import Path
 
-# 小显存优化：减少 CUDA 显存碎片，缓解 8GB 卡 LoKr full-matrix OOM。
-# - 必须在 torch 链式 import 之前设置：torch 在 import 阶段就读 PYTORCH_CUDA_ALLOC_CONF
-#   并缓存，之后再改无效。
-# - expandable_segments 的 CUDA backend 实现需要 PYTORCH_C10_DRIVER_API_SUPPORTED 宏，
-#   PyTorch 的 c10/cuda/CMakeLists.txt 把该宏 gate 在 `if(NOT WIN32)`，因此 Windows wheel
-#   不包含该 backend，运行时会 emit `TORCH_WARN_ONCE("expandable_segments not supported
-#   on this platform")` 并强制 disable。为避免 Windows 用户看无用 warning，只在 Linux 设。
-# - setdefault 不覆盖用户已显式设置的值。
-if sys.platform.startswith("linux"):
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# CUDA 分配器配置：**不默认启用 expandable_segments**。
+# - expandable_segments 是 CUDA(NVIDIA) 的分配器特性，能减少显存碎片；但它是纯 CUDA
+#   实现，在 AMD ROCm (HIP) 上不受支持且实测有 bug——开启后 hipMalloc 异常，模型
+#   .to(device) 就 OOM（哪怕显存充足）。本项目同时支持 NVIDIA 与 AMD 卡，不能默认开。
+# - 需要它防碎片的 CUDA 用户，请自行通过环境变量 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+#   在启动前设置；setdefault 会尊重用户显式设置的值。
+# - 注意：该变量必须在 torch 链式 import 之前设置才生效（torch import 阶段即缓存）。
+# - 显存上限由 _log_allocator_state() 里的 set_per_process_memory_fraction(0.95) 统一管理，
+#   该 API 对 CUDA 与 ROCm 都安全。
 
 # 脚本在 runtime/ 下按裸脚本启动（`python runtime/anima_train.py`）。
 # 把仓库根 + runtime/ 注入 sys.path，让 `import utils.*` / `import train_monitor` /
