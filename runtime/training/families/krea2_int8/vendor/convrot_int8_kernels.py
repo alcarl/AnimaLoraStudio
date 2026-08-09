@@ -60,6 +60,13 @@ except ImportError:
 
 _HADAMARD_CACHE = {}
 
+#: int8_linear 分块时的单 chunk 显存预算（字节）。ROCm(hipMalloc) 对同时驻留的大块
+#: 连续分配敏感，分块让每次只物化 [chunk_m, K] 的旋转激活 + 量化结果，并及时 del
+#: 释放，从而降低「output 分配时刻」的峰值 allocated（backward/前向贴近显存上限时
+#: 这就是 OOM 的关键）。128MB 让 K=7680 时 chunk_m≈4369（~2-3 个 chunk），分块够细
+#: 又不至于因 Triton 多次启动而太慢。
+_INT8_CHUNK_BUDGET_BYTES = 128 * 1024 * 1024
+
 
 def _build_hadamard(
     size: int,
@@ -113,18 +120,35 @@ def _rotate_activation(
     h: torch.Tensor,
     group_size: int,
 ) -> torch.Tensor:
-    """Rotate activation online using Optimized Matmul implementation."""
+    """Rotate activation online using Optimized Matmul implementation.
+
+    AMD 分块优化：把 token 行按 chunk 旋转，只物化当前 chunk 的 [cm, features]
+    中间张量并立即写入结果视图，降低单次大块分配（ROCm hipMalloc 对同时驻留的
+    大块连续分配敏感，backward 贴近显存上限时整体一次 [M, features] 旋转易 OOM）。
+    """
     orig_shape = x.shape
     features = orig_shape[-1]
     if features % group_size != 0:
         raise ValueError(f"features {features} not divisible by group_size {group_size}")
     n_groups = features // group_size
 
-    x_grouped = x.reshape(-1, n_groups, group_size)
+    x_2d = x.reshape(-1, features)
+    m = x_2d.shape[0]
     h = h.to(dtype=x.dtype, device=x.device)
-    x_rotated = torch.matmul(x_grouped, h)
 
-    return x_rotated.reshape(orig_shape)
+    result = torch.empty_like(x)
+    result_2d = result.reshape(-1, features)
+
+    chunk_m = max(1, min(m, _INT8_CHUNK_BUDGET_BYTES // max(1, features * 4)))
+    for i in range(0, m, chunk_m):
+        end = min(i + chunk_m, m)
+        cm = end - i
+        xi = x_2d[i:end]
+        x_rotated = torch.matmul(xi.reshape(cm, n_groups, group_size), h).reshape(cm, features)
+        result_2d[i:end].copy_(x_rotated)
+        del xi, x_rotated
+
+    return result.reshape(orig_shape)
 
 
 # =============================================================================
@@ -470,30 +494,6 @@ if HAS_TRITON:
         m, k = x_2d.shape
         n = weight.shape[0]
 
-        # Quantize input per-row using fused or normal quantization kernel
-        if convrot:
-            h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-            
-            # 为了配合 Gradient Checkpointing，这里使用非原地操作
-            n_groups = k // convrot_groupsize
-            x_grouped = x_2d.reshape(-1, n_groups, convrot_groupsize)
-            h = h.to(dtype=x_2d.dtype, device=x_2d.device)
-            
-            # 分配临时旋转张量，不破坏原始的 x_2d
-            x_rotated_3d = torch.matmul(x_grouped, h)
-            x_rotated = x_rotated_3d.reshape(m, k)
-            
-            # 执行量化
-            x_int8, x_scale = triton_quantize_rowwise(x_rotated)
-            
-            # --- AMD 专属优化：量化完成后立即释放临时张量，腾出连续显存空间 ---
-            del x_rotated_3d, x_rotated, h
-        else:
-            x_int8, x_scale = triton_quantize_rowwise(x_2d)
-
-        # 此时申请巨型输出矩阵，显存已经被手动清理过，处于当前步骤的安全低谷
-        output = torch.empty((m, n), device=x.device, dtype=out_dtype)
-
         is_per_channel = False
         if not isinstance(weight_scale, torch.Tensor):
             weight_scale = torch.tensor([weight_scale], device=x.device, dtype=torch.float32)
@@ -505,48 +505,56 @@ if HAS_TRITON:
 
         has_bias = bias is not None
         bias_ptr = bias if has_bias else x
+        kernel = _int8_matmul_dequant_per_row_kernel if is_per_channel else _int8_matmul_dequant_kernel
+
+        # --- 分块（借鉴 comfy_kitchen/backends/eager/quantization.py int8_linear 的
+        #     分块反量化思路）：把 m（token 行）切成若干 chunk，每个 chunk 独立做
+        #     旋转 + 量化 + Triton GEMM，写回 output 的对应行视图。ROCm (hipMalloc)
+        #     对「同时驻留的大块连续分配」很敏感，整体一次分配 [M,K] 旋转激活 +
+        #     [M,N] 输出在显存贴近上限时容易失败；分块后峰值时刻只驻留 [cm,K]，
+        #     单次分配大幅变小，降低 OOM 概率。 ---
+        # 每行预算：k 个元素（bf16 旋转激活 2B + int8 量化 1B，留 int32 中间余量 ~4B）
+        chunk_m = max(1, min(m, _INT8_CHUNK_BUDGET_BYTES // max(1, k * 4)))
+        output = torch.empty((m, n), device=x.device, dtype=out_dtype)
 
         def grid(meta):
-            return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
+            return (triton.cdiv(chunk_m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
 
-        if is_per_channel:
-            _int8_matmul_dequant_per_row_kernel[grid](
+        for i in range(0, m, chunk_m):
+            end = min(i + chunk_m, m)
+            cm = end - i
+            xi = x_2d[i:end]
+            if convrot:
+                h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+                h = h.to(dtype=xi.dtype, device=xi.device)
+                # 非原地操作，配合 Gradient Checkpointing
+                n_groups = k // convrot_groupsize
+                # 分块旋转：只物化当前 chunk 的 [cm, K]，算完立即释放
+                x_rotated = torch.matmul(xi.reshape(cm, n_groups, convrot_groupsize), h).reshape(cm, k)
+                x_int8, x_scale = triton_quantize_rowwise(x_rotated)
+                del x_rotated, h  # AMD 专属优化：及时释放临时张量，腾出连续显存
+            else:
+                x_int8, x_scale = triton_quantize_rowwise(xi)
+            out_view = output[i:end]
+            kernel[grid](
                 a_ptr=x_int8,
                 b_ptr=weight,
-                c_ptr=output,
+                c_ptr=out_view,
                 a_scale_ptr=x_scale,
                 b_scale_ptr=weight_scale,
                 bias_ptr=bias_ptr,
-                m=m,
+                m=cm,
                 n=n,
                 k=k,
                 stride_am=x_int8.stride(0),
                 stride_ak=x_int8.stride(1),
                 stride_bk=weight.stride(1),
                 stride_bn=weight.stride(0),
-                stride_cm=output.stride(0),
-                stride_cn=output.stride(1),
+                stride_cm=out_view.stride(0),
+                stride_cn=out_view.stride(1),
                 has_bias=has_bias,
             )
-        else:
-            _int8_matmul_dequant_kernel[grid](
-                a_ptr=x_int8,
-                b_ptr=weight,
-                c_ptr=output,
-                a_scale_ptr=x_scale,
-                b_scale_ptr=weight_scale,
-                bias_ptr=bias_ptr,
-                m=m,
-                n=n,
-                k=k,
-                stride_am=x_int8.stride(0),
-                stride_ak=x_int8.stride(1),
-                stride_bk=weight.stride(1),
-                stride_bn=weight.stride(0),
-                stride_cm=output.stride(0),
-                stride_cn=output.stride(1),
-                has_bias=has_bias,
-            )
+            del x_int8, x_scale, xi, out_view
 
         return output.reshape(*orig_shape[:-1], n)
 
