@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import sys
 from pathlib import Path
 
@@ -218,75 +217,86 @@ class VAEWrapper:
 
     @torch.no_grad()
     def _tiled_decode(self, z):
-        """在 H/W 维度切块独立 decode，cosine blend 拼回。
+        """在 H/W 维度切块独立 decode（移植自 musubi-tuner / diffusers AutoencoderKL
+        官方 tiled_decode）：固定 tile / 固定 stride 步进 + 相邻 tile 线性 blend +
+        每 tile 只取前 ``stride`` 部分裁减拼接。
 
-        - tile=64 latent，stride=48，overlap=16 latent (128 px)；最后一个 tile
-          起点 clamp 到 (size - tile) 防超出
-        - 小图（H 或 W < tile）走 ``eff_h/eff_w = min(tile, size)``，等价单 tile 全图
-        - blend 用 raised cosine 边缘 ramp，accumulator 走 fp32 防 bf16 精度损失
-        - mask 最小值 clamp 1e-6 防角落像素 wsum 除 0
+        相比旧的 cosine-blend + ``acc/wsum`` 方案：
+        - 不做归一化除，边界 tile 的拼接就是最后 tile 的实际输出，**不会因
+          wsum→0 / 归一化放大而把 VAE 边缘噪声放大**；
+        - 边界 tile 被切片自动 clamp，天然无边界 mask 归零问题。
+
+        输入 ``z`` 为已归一化 latent；先整体反归一化到 raw latent，再逐 tile
+        走 ``decoder + conv2``，最后 clamp 到 [-1, 1]（对齐整图 decode 语义）。
+
+        ``z``: [b, 16, t, H, W]（latent 空间）。返回 [b, 3, t, H*8, W*8]（像素）。
         """
         b, _c, t, H, W = z.shape
-        tile = self._TILE_LATENT
-        stride = self._STRIDE_LATENT
         up = self._UPSAMPLE
+        model = self.model
 
-        eff_h = min(tile, H)
-        eff_w = min(tile, W)
-        hs = _tile_starts(H, eff_h, stride)
-        ws = _tile_starts(W, eff_w, stride)
+        # 反归一化：latent = (raw - mean) * (1/std)  ⇒  raw = z / (1/std) + mean = z * std + mean
+        mean = self.mean.to(z.dtype)
+        std = self.std.to(z.dtype)
+        z_raw = z * std.view(1, -1, 1, 1, 1) + mean.view(1, -1, 1, 1, 1)
 
-        tile_h_px = eff_h * up
-        tile_w_px = eff_w * up
-        overlap_px = (tile - stride) * up
-        H_px, W_px = H * up, W * up
+        # 固定 tile 尺寸（对齐 musubi：tile=64 latent, stride=48 latent，overlap=16）
+        tile_lat = self._TILE_LATENT          # 64 latent
+        stride_lat = self._STRIDE_LATENT      # 48 latent
+        # decoder 在像素空间 upsample 8×，故 blend 与裁减都在像素空间进行
+        tile_px = tile_lat * up               # 512 px
+        stride_px = stride_lat * up           # 384 px
+        blend_px = tile_px - stride_px        # 128 px
 
-        acc = torch.zeros(b, 3, t, H_px, W_px, dtype=torch.float32, device=z.device)
-        wsum = torch.zeros(1, 1, 1, H_px, W_px, dtype=torch.float32, device=z.device)
+        rows = []
+        for i in range(0, H, stride_lat):
+            row = []
+            for j in range(0, W, stride_lat):
+                model.clear_cache()
+                time = []
+                for k in range(t):
+                    model._conv_idx = [0]
+                    z_tile = z_raw[:, :, k:k + 1, i:i + tile_lat, j:j + tile_lat]
+                    x = model.conv2(z_tile)
+                    decoded = model.decoder(x, feat_cache=model._feat_map, feat_idx=model._conv_idx)
+                    time.append(decoded)
+                row.append(torch.cat(time, dim=2))
+            rows.append(row)
+        model.clear_cache()
 
-        mask_base = _cosine_blend_mask(tile_h_px, tile_w_px, fade=overlap_px, device=z.device)
-        # 边界 tile 的外缘没有相邻 tile，mask 不应 fade（否则该缘 wsum→0 → noise band；
-        # 比如 768²、tile 64/stride 48 latent 时 hs=[0,32]，第二个 tile 的 bottom=图像下边缘，
-        # 当前 mask 在 -fade 区衰减到 ~0，导致 acc/wsum 在底部放大 VAE 的边缘噪声）。
-        last_hi = hs[-1]
-        last_wi = ws[-1]
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = _blend_v(rows[i - 1][j], tile, blend_px)
+                if j > 0:
+                    tile = _blend_h(row[j - 1], tile, blend_px)
+                result_row.append(tile[:, :, :, :stride_px, :stride_px])
+            result_rows.append(torch.cat(result_row, dim=-1))
 
-        for hi in hs:
-            for wi in ws:
-                z_tile = z[:, :, :, hi:hi + eff_h, wi:wi + eff_w]
-                img_tile = self.model.decode(z_tile, self.scale).float()
-                hp, wp = hi * up, wi * up
-                m = mask_base
-                if hi == 0:
-                    m = m.clone()
-                    m[..., :overlap_px, :] = 1.0
-                if hi == last_hi:
-                    m = m.clone()
-                    m[..., -overlap_px:, :] = 1.0
-                if wi == 0:
-                    m = m.clone()
-                    m[..., :, :overlap_px] = 1.0
-                if wi == last_wi:
-                    m = m.clone()
-                    m[..., :, -overlap_px:] = 1.0
-                acc[:, :, :, hp:hp + tile_h_px, wp:wp + tile_w_px] += img_tile * m
-                wsum[:, :, :, hp:hp + tile_h_px, wp:wp + tile_w_px] += m
-
-        return (acc / wsum).to(z.dtype)
+        out = torch.cat(result_rows, dim=3)[:, :, :, :H * up, :W * up]
+        # 与整图 decode（self.model.decode）一致：不在此 clamp，由调用方
+        # （如 _decode_to_pil）统一 clamp，保证 tile/整图路径语义等价。
+        return out
 
     @torch.no_grad()
     def _tiled_encode(self, pixels, tile_px=None, overlap_px=None):
-        """在 H/W 维度切块独立 encode，latent 空间 cosine blend 拼回。
+        """在 H/W 维度切块独立 encode（移植自 musubi-tuner / diffusers 官方
+        tiled_encode）：固定 tile / 固定 stride 步进 + 相邻 tile 线性 blend +
+        每 tile 只取前 ``stride`` 部分裁减拼接。
 
-        - 默认 tile=512px / stride=384px / overlap=128px（= decode 的 64/48/16 latent ×8）
-        - ``tile_px`` / ``overlap_px``（像素）非 None 时覆盖默认，供缓存分块按 config 传入；
-          二者须为 VAE 下采样（``up``）的整倍数（latent 块边界落整格）
-        - 像素起点恒为 8 的倍数 → latent 位置为整数（_TILE/_STRIDE×8 与 H/W 均整除 8）
-        - blend 在 latent 空间，accumulator 走 fp32
-        - encode 非线性，拼接为近似（overlap+cosine 抹平 tile 边界），用于 latent 缓存足够
+        在 **raw latent 层** 操作（不经 scale 归一化），拼出完整 raw mu 后
+        最后统一归一化。避免旧的 ``acc/wsum`` cosine 方案在边界 wsum 归零放大噪声。
+
+        ``pixels``: [b, 3, t, H, W]（像素）。``tile_px`` / ``overlap_px``（像素）
+        非 None 时可覆盖默认（供缓存分块按 config 传入），须为 ``up`` 的整倍数。
+        返回 [b, 16, t, H/8, W/8] 归一化 latent。
         """
         b, _c, t, H, W = pixels.shape
         up = self._UPSAMPLE
+        model = self.model
+
         if tile_px is None:
             tile_px = self._TILE_LATENT * up
             stride_px = self._STRIDE_LATENT * up
@@ -303,76 +313,78 @@ class VAEWrapper:
                 raise ValueError(f"overlap_px={ov_px} 必须满足 0 <= overlap < tile_px={tile_px}")
             stride_px = tile_px - ov_px
 
-        eff_h = min(tile_px, H)
-        eff_w = min(tile_px, W)
-        hs = _tile_starts(H, eff_h, stride_px)
-        ws = _tile_starts(W, eff_w, stride_px)
-
         lat_h, lat_w = H // up, W // up
-        tile_lh, tile_lw = eff_h // up, eff_w // up
-        overlap_lat = (tile_px - stride_px) // up
+        tile_lat = tile_px // up          # 64（默认）
+        stride_lat = stride_px // up      # 48（默认）
+        blend_lat = tile_lat - stride_lat
 
-        # encode 输出通道 = z_dim(16)。从第一个 tile 拿真实通道数更稳，但 WAN VAE 固定 16。
-        acc = torch.zeros(b, 16, t, lat_h, lat_w, dtype=torch.float32, device=pixels.device)
-        wsum = torch.zeros(1, 1, 1, lat_h, lat_w, dtype=torch.float32, device=pixels.device)
+        rows = []
+        for i in range(0, H, stride_px):
+            row = []
+            for j in range(0, W, stride_px):
+                model.clear_cache()
+                time = []
+                # WanVAE encoder 时间上按 1/4/4/... 分帧；这里 t=1 恒为单帧
+                frame_range = 1 + (t - 1) // 4
+                for k in range(frame_range):
+                    model._enc_conv_idx = [0]
+                    if k == 0:
+                        px = pixels[:, :, :1, i:i + tile_px, j:j + tile_px]
+                    else:
+                        px = pixels[:, :, 1 + 4 * (k - 1):1 + 4 * k, i:i + tile_px, j:j + tile_px]
+                    raw = model.encoder(px, feat_cache=model._enc_feat_map, feat_idx=model._enc_conv_idx)
+                    raw = model.conv1(raw)
+                    time.append(raw)
+                row.append(torch.cat(time, dim=2))
+            rows.append(row)
+        model.clear_cache()
 
-        mask_base = _cosine_blend_mask(tile_lh, tile_lw, fade=overlap_lat, device=pixels.device)
-        # 边界 tile 的外缘没有相邻 tile，mask 不应 fade（同 decode 的修复原因）
-        last_hi = hs[-1]
-        last_wi = ws[-1]
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = _blend_v(rows[i - 1][j], tile, blend_lat)
+                if j > 0:
+                    tile = _blend_h(row[j - 1], tile, blend_lat)
+                result_row.append(tile[:, :, :, :stride_lat, :stride_lat])
+            result_rows.append(torch.cat(result_row, dim=-1))
 
-        for hi in hs:
-            for wi in ws:
-                px_tile = pixels[:, :, :, hi:hi + eff_h, wi:wi + eff_w]
-                z_tile = self.model.encode(px_tile, self.scale).float()
-                lh, lw = hi // up, wi // up
-                m = mask_base
-                if hi == 0:
-                    m = m.clone()
-                    m[..., :overlap_lat, :] = 1.0
-                if hi == last_hi:
-                    m = m.clone()
-                    m[..., -overlap_lat:, :] = 1.0
-                if wi == 0:
-                    m = m.clone()
-                    m[..., :, :overlap_lat] = 1.0
-                if wi == last_wi:
-                    m = m.clone()
-                    m[..., :, -overlap_lat:] = 1.0
-                acc[:, :, :, lh:lh + tile_lh, lw:lw + tile_lw] += z_tile * m
-                wsum[:, :, :, lh:lh + tile_lh, lw:lw + tile_lw] += m
-
-        return (acc / wsum).to(pixels.dtype)
-
-
-def _tile_starts(size: int, tile: int, stride: int) -> list[int]:
-    """固定 stride 的 tile 起点列表；尾部未覆盖时追加 ``size - tile``。"""
-    if size <= tile:
-        return [0]
-    starts = list(range(0, size - tile + 1, stride))
-    if starts[-1] + tile < size:
-        starts.append(size - tile)
-    return starts
+        raw_mu = torch.cat(result_rows, dim=3)[:, :, :, :lat_h, :lat_w]
+        # conv1 输出前 z_dim 通道是 mu（WanVAE_.encode 的 chunk(2, dim=1) 语义）
+        mu = raw_mu[:, : self.model.z_dim]
+        # 归一化：latent = (mu - mean) * (1/std)
+        mean = self.mean.to(mu.dtype)
+        std = self.std.to(mu.dtype)
+        return ((mu - mean.view(1, -1, 1, 1, 1)) / std.view(1, -1, 1, 1, 1)).to(pixels.dtype)
 
 
-def _cosine_blend_mask(h: int, w: int, *, fade: int, device) -> torch.Tensor:
-    """2D raised-cosine mask；边缘 `fade` 像素内 0→1 ramp，中心 1。
+def _blend_v(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    """垂直方向相邻 tile 线性 blend（musubi / diffusers 官方实现）。
 
-    最终 mask 整体 clamp_min(1e-6) 防 wsum 角落除 0 —— 2D 角落是 1D × 1D，
-    1D 上 clamp 1e-6 在 2D 角落变成 1e-12 太接近 fp32 denormal，统一在 2D 后 clamp。
+    ``a`` 为上方 tile，``b`` 为当前 tile；把 ``b`` 顶部 ``blend_extent`` 行替换成
+    与 ``a`` 底部的线性插值，消 tile 缝。原地修改 ``b`` 并返回。
     """
-    def ramp_1d(n: int) -> torch.Tensor:
-        m = torch.ones(n, dtype=torch.float32, device=device)
-        if fade > 0:
-            t = torch.linspace(math.pi, 2 * math.pi, fade, device=device)
-            r = torch.cos(t) * 0.5 + 0.5
-            m[:fade] = r
-            m[-fade:] = r.flip(0)
-        return m
-    mh = ramp_1d(h)
-    mw = ramp_1d(w)
-    mask_2d = (mh[:, None] * mw[None, :]).clamp_min(1e-6)
-    return mask_2d[None, None, None, :, :]
+    blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+    if blend_extent <= 0:
+        return b
+    for y in range(blend_extent):
+        b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (y / blend_extent)
+    return b
+
+
+def _blend_h(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    """水平方向相邻 tile 线性 blend（musubi / diffusers 官方实现）。
+
+    ``a`` 为左侧 tile，``b`` 为当前 tile；把 ``b`` 左部 ``blend_extent`` 列替换成
+    与 ``a`` 右侧的线性插值，消 tile 缝。原地修改 ``b`` 并返回。
+    """
+    blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+    if blend_extent <= 0:
+        return b
+    for x in range(blend_extent):
+        b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (x / blend_extent)
+    return b
 
 
 def load_vae(vae_path, device, dtype, repo_root, *, tiling: str = "auto"):
