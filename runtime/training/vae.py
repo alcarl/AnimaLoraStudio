@@ -244,15 +244,33 @@ class VAEWrapper:
         acc = torch.zeros(b, 3, t, H_px, W_px, dtype=torch.float32, device=z.device)
         wsum = torch.zeros(1, 1, 1, H_px, W_px, dtype=torch.float32, device=z.device)
 
-        mask = _cosine_blend_mask(tile_h_px, tile_w_px, fade=overlap_px, device=z.device)
+        mask_base = _cosine_blend_mask(tile_h_px, tile_w_px, fade=overlap_px, device=z.device)
+        # 边界 tile 的外缘没有相邻 tile，mask 不应 fade（否则该缘 wsum→0 → noise band；
+        # 比如 768²、tile 64/stride 48 latent 时 hs=[0,32]，第二个 tile 的 bottom=图像下边缘，
+        # 当前 mask 在 -fade 区衰减到 ~0，导致 acc/wsum 在底部放大 VAE 的边缘噪声）。
+        last_hi = hs[-1]
+        last_wi = ws[-1]
 
         for hi in hs:
             for wi in ws:
                 z_tile = z[:, :, :, hi:hi + eff_h, wi:wi + eff_w]
                 img_tile = self.model.decode(z_tile, self.scale).float()
                 hp, wp = hi * up, wi * up
-                acc[:, :, :, hp:hp + tile_h_px, wp:wp + tile_w_px] += img_tile * mask
-                wsum[:, :, :, hp:hp + tile_h_px, wp:wp + tile_w_px] += mask
+                m = mask_base
+                if hi == 0:
+                    m = m.clone()
+                    m[..., :overlap_px, :] = 1.0
+                if hi == last_hi:
+                    m = m.clone()
+                    m[..., -overlap_px:, :] = 1.0
+                if wi == 0:
+                    m = m.clone()
+                    m[..., :, :overlap_px] = 1.0
+                if wi == last_wi:
+                    m = m.clone()
+                    m[..., :, -overlap_px:] = 1.0
+                acc[:, :, :, hp:hp + tile_h_px, wp:wp + tile_w_px] += img_tile * m
+                wsum[:, :, :, hp:hp + tile_h_px, wp:wp + tile_w_px] += m
 
         return (acc / wsum).to(z.dtype)
 
@@ -298,15 +316,31 @@ class VAEWrapper:
         acc = torch.zeros(b, 16, t, lat_h, lat_w, dtype=torch.float32, device=pixels.device)
         wsum = torch.zeros(1, 1, 1, lat_h, lat_w, dtype=torch.float32, device=pixels.device)
 
-        mask = _cosine_blend_mask(tile_lh, tile_lw, fade=overlap_lat, device=pixels.device)
+        mask_base = _cosine_blend_mask(tile_lh, tile_lw, fade=overlap_lat, device=pixels.device)
+        # 边界 tile 的外缘没有相邻 tile，mask 不应 fade（同 decode 的修复原因）
+        last_hi = hs[-1]
+        last_wi = ws[-1]
 
         for hi in hs:
             for wi in ws:
                 px_tile = pixels[:, :, :, hi:hi + eff_h, wi:wi + eff_w]
                 z_tile = self.model.encode(px_tile, self.scale).float()
                 lh, lw = hi // up, wi // up
-                acc[:, :, :, lh:lh + tile_lh, lw:lw + tile_lw] += z_tile * mask
-                wsum[:, :, :, lh:lh + tile_lh, lw:lw + tile_lw] += mask
+                m = mask_base
+                if hi == 0:
+                    m = m.clone()
+                    m[..., :overlap_lat, :] = 1.0
+                if hi == last_hi:
+                    m = m.clone()
+                    m[..., -overlap_lat:, :] = 1.0
+                if wi == 0:
+                    m = m.clone()
+                    m[..., :, :overlap_lat] = 1.0
+                if wi == last_wi:
+                    m = m.clone()
+                    m[..., :, -overlap_lat:] = 1.0
+                acc[:, :, :, lh:lh + tile_lh, lw:lw + tile_lw] += z_tile * m
+                wsum[:, :, :, lh:lh + tile_lh, lw:lw + tile_lw] += m
 
         return (acc / wsum).to(pixels.dtype)
 
